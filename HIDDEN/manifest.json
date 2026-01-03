@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "FACEIT Risk Warning",
+  "version": "1.0",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": ["https://www.faceit.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+ "content_scripts": [{
+    "matches": [
+        "https://www.faceit.com/*/players/*",
+        "https://www.faceit.com/*/room/*",
+        "https://www.faceit.com/*/matchroom/*",
+        "https://www.faceit.com/*/lobby/*",
+        "https://www.faceit.com/*/championship/*/room/*"
+    ],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+}],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "FACEIT Risk Monitor"
+  }
+}

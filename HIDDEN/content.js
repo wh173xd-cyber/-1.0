@@ -1,325 +1,702 @@
-// content.js - FACEIT Risk Warning
-console.log('[FACEIT Risk] Content script загружен');
+// ========== 1. КОНФИГУРАЦИЯ И КЭШ   2a070f22-2ec8-4581-89e5-8105fa0cea9e   ==========
+const API_KEY = ' 2a070f22-2ec8-4581-89e5-8105fa0cea9e,, '; // 🔒 Замените на ваш ключ!
+const API_URL = 'https://open.faceit.com/data/v4';
+const CACHE_TTL = 600000; // 1 минута в миллисекундах
 
-const MY_ELO = 2500;
-const ELO_DIFFERENCE_THRESHOLD = 500;
-const LOW_RISK_ELO_DIFFERENCE = 5;
+let matchStatusCache = new Map();
+let isProcessing = false;
+let processedPlayers = new Set();
 
-let warningPanel = null;
-let riskIndicator = null;
-let processedPlayers = new Set(); // Для отслеживания обработанных игроков
-let isProcessing = false; // Защита от повторных вызовов
+// ========== СПИСОК ПОМЕЧЕННЫХ ИГРОКОВ ==========
+let trackedPlayers = {};
 
-// ========== 1. БЛОКИРОВКА SENTRY ==========
-if (window.location.hostname.includes('faceit.com')) {
-    console.log('[FACEIT Risk] Sentry отключен на FACEIT');
-    const originalFetch = window.fetch;
-    window.fetch = function(...args) {
-        const url = args[0];
-        if (typeof url === 'string' && url.includes('sentry.io')) {
-            return Promise.reject(new Error('Sentry заблокирован'));
+// Загрузка сохраненных игроков из localStorage
+function loadTrackedPlayers() {
+    try {
+        const saved = localStorage.getItem('faceit_tracked_players');
+        if (saved) {
+            trackedPlayers = JSON.parse(saved);
+            console.log('[FACEIT Status] Загружены помеченные игроки:', Object.keys(trackedPlayers).length);
         }
-        return originalFetch.apply(this, args);
+    } catch (e) {
+        console.error('[FACEIT Status] Ошибка загрузки помеченных игроков:', e);
+        trackedPlayers = {};
+    }
+}
+
+// Сохранение помеченных игроков в localStorage
+function saveTrackedPlayers() {
+    try {
+        localStorage.setItem('faceit_tracked_players', JSON.stringify(trackedPlayers));
+    } catch (e) {
+        console.error('[FACEIT Status] Ошибка сохранения помеченных игроков:', e);
+    }
+}
+
+// ========== 2. ОСНОВНАЯ ФУНКЦИЯ: ПОЛУЧЕНИЕ СТАТУСА МАТЧА ==========
+async function fetchPlayerMatchStatus(nickname) {
+    const cacheKey = nickname.toLowerCase();
+    const cached = matchStatusCache.get(cacheKey);
+    
+    // Проверка кэша
+    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+        console.log(`[FACEIT Status] Используем кэш для: ${nickname}`);
+        return cached.data;
+    }
+    
+    try {
+        console.log(`[FACEIT Status] Запрашиваем API для: ${nickname}`);
+        
+        // 1. Получаем player_id по никнейму
+        const playerResponse = await fetch(
+            `https://open.faceit.com/data/v4/players?nickname=${encodeURIComponent(nickname)}`,
+            {
+                method: 'GET',
+                headers: { 'Authorization': `Bearer ${API_KEY}` }
+            }
+        );
+        
+        if (!playerResponse.ok) {
+            throw new Error(`API ошибка: ${playerResponse.status} ${playerResponse.statusText}`);
+        }
+        
+        const playerData = await playerResponse.json();
+        
+        if (!playerData.player_id) {
+            throw new Error('Игрок не найден в API');
+        }
+        
+        const playerId = playerData.player_id;
+        
+        // 2. Получаем последний матч игрока
+        const matchResponse = await fetch(
+            `https://open.faceit.com/data/v4/players/${playerId}/history?game=cs2&limit=1&offset=0`,
+            {
+                method: 'GET',
+                headers: { 'Authorization': `Bearer ${API_KEY}` }
+            }
+        );
+        
+        if (!matchResponse.ok) {
+            throw new Error(`API ошибка истории: ${matchResponse.status}`);
+        }
+        
+        const matchData = await matchResponse.json();
+        
+        const result = {
+            playerId,
+            nickname,
+            lastMatch: matchData.items?.[0] || null,
+            timestamp: Date.now()
+        };
+        
+        // Сохраняем в кэш
+        matchStatusCache.set(cacheKey, {
+            data: result,
+            timestamp: Date.now()
+        });
+        
+        return result;
+        
+    } catch (error) {
+        console.error(`[FACEIT Status] Ошибка для ${nickname}:`, error.message);
+        return {
+            playerId: null,
+            nickname,
+            lastMatch: null,
+            error: error.message,
+            timestamp: Date.now()
+        };
+    }
+}
+
+// ========== 3. АНАЛИЗ ВРЕМЕНИ ЗАВЕРШЕНИЯ МАТЧА ==========
+function calculateTimeStatus(matchData) {
+    if (!matchData?.lastMatch) {
+        return { status: 'no_data', label: 'Нет данных', color: '#9e9e9e', emoji: '❓' };
+    }
+    
+    const match = matchData.lastMatch;
+    const now = Math.floor(Date.now() / 1000);
+    const finishedAt = match.finished_at;
+    const startedAt = match.started_at;
+    const status = match.status ? match.status.toUpperCase() : '';
+    
+    // Проверяем статус матча
+    if (status === 'ONGOING' || status === 'LIVE' || status === 'IN_PROGRESS') {
+        const duration = now - startedAt;
+        const minutes = Math.floor(duration / 60);
+        return {
+            status: 'in_progress',
+            label: `В игре (${minutes} мин)`,
+            color: '#ff5722',
+            emoji: '🎮',
+            details: `ID: ${match.match_id}`,
+            finishedAt: finishedAt
+        };
+    }
+    
+    if (status === 'FINISHED' && finishedAt && finishedAt > 0) {
+        const timeDiff = now - finishedAt;
+        
+        let label, color, emoji;
+        
+        if (timeDiff < 300) {
+            label = 'Только что';
+            color = '#f44336';
+            emoji = '🔥';
+        } else if (timeDiff < 3600) {
+            const minutes = Math.floor(timeDiff / 60);
+            label = `${minutes} мин назад`;
+            color = '#ff9800';
+            emoji = '⏱️';
+        } else if (timeDiff < 86400) {
+            const hours = Math.floor(timeDiff / 3600);
+            label = `${hours} ч назад`;
+            color = '#4caf50';
+            emoji = '✅';
+        } else {
+            const days = Math.floor(timeDiff / 86400);
+            label = `${days} д назад`;
+            color = '#607d8b';
+            emoji = '📅';
+        }
+        
+        return {
+            status: 'finished',
+            label,
+            color,
+            emoji,
+            details: `${new Date(finishedAt * 1000).toLocaleString('ru-RU')}`,
+            finishedAt: finishedAt
+        };
+    }
+    
+    // Обработка других статусов
+    if (status === 'CANCELLED' || status === 'ABORTED') {
+        return {
+            status: 'cancelled',
+            label: 'Отменен',
+            color: '#9e9e9e',
+            emoji: '❌'
+        };
+    }
+    
+    if (status === 'UPCOMING' || status === 'SCHEDULED') {
+        return {
+            status: 'upcoming',
+            label: 'Ожидается',
+            color: '#2196f3',
+            emoji: '⏳'
+        };
+    }
+    
+    return {
+        status: 'unknown',
+        label: 'Неизвестно',
+        color: '#9e9e9e',
+        emoji: '❓'
     };
 }
 
-// ========== 2. ОПТИМИЗИРОВАННЫЙ ПОИСК ELO ==========
-// ========== 2. ИСПРАВЛЕННЫЙ ПОИСК ELO ==========
-function getPlayerEloInMatchRoom(playerContainer, nickname) {
-    if (!playerContainer) return 2000;
+// ========== 4. ДОБАВЛЕНИЕ КНОПКИ С СТАТУСОМ И КНОПКИ ДОБАВЛЕНИЯ В СПИСОК ==========
+function addMatchStatusButton(playerContainer, nickname) {
+    const buttonId = 'status_' + nickname.toLowerCase();
     
-    console.log(`[FACEIT Risk] Ищем ELO для: ${nickname}`);
+    if (processedPlayers.has(buttonId)) return;
+    if (playerContainer.querySelector('.faceit-status-btn')) return;
     
-    // Стратегия 1: Ищем ELO внутри контейнера игрока
-    const eloElement = playerContainer.querySelector('div.TextBlock__Holder-sc-1bbd9bc2-0.fjYAKC > div > span');
+    processedPlayers.add(buttonId);
     
-    if (eloElement?.textContent) {
-        const text = eloElement.textContent.trim();
-        const match = text.match(/(\d{3,4})/);
-        if (match) {
-            const elo = parseInt(match[1]);
-            if (elo >= 500 && elo <= 5000) {
-                console.log(`[FACEIT Risk] Найден ELO в контейнере: ${elo}`);
-                return elo;
-            }
-        }
-    }
+    // Создаем контейнер для кнопок
+    const buttonContainer = document.createElement("div");
+    buttonContainer.className = "faceit-buttons-container";
+    buttonContainer.style.cssText = `
+        display: inline-flex !important;
+        gap: 5px !important;
+        margin-left: 10px !important;
+        vertical-align: middle !important;
+    `;
     
-    // Стратегия 2: Ищем все ELO на странице и сопоставляем по порядку
-    const allEloElements = document.querySelectorAll('div.TextBlock__Holder-sc-1bbd9bc2-0.fjYAKC > div > span');
-    console.log(`[FACEIT Risk] Всего ELO на странице: ${allEloElements.length}`);
+    // Кнопка проверки статуса
+    const statusButton = document.createElement("button");
+    statusButton.className = "faceit-status-btn";
+    statusButton.dataset.nickname = nickname;
     
-    // Находим индекс текущего контейнера среди всех контейнеров игроков
-    const allPlayerContainers = document.querySelectorAll(`
-        div.ListContentPlayer__Background-sc-36ad4183-0.bTaihS,
-        div[class*="ListContentPlayer__Background"]
-    `);
+    statusButton.style.cssText = `
+        background: #9e9e9e !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 4px !important;
+        padding: 4px 8px !important;
+        font-size: 11px !important;
+        font-weight: bold !important;
+        cursor: pointer !important;
+        min-width: 90px !important;
+        text-align: center !important;
+        transition: background 0.3s !important;
+        flex-shrink: 0 !important;
+    `;
     
-    let containerIndex = -1;
-    for (let i = 0; i < allPlayerContainers.length; i++) {
-        if (allPlayerContainers[i] === playerContainer) {
-            containerIndex = i;
-            break;
-        }
-    }
+    statusButton.innerHTML = '🔄 Проверить';
+    statusButton.title = `Проверить статус матча для ${nickname}`;
     
-    console.log(`[FACEIT Risk] Контейнер ${nickname} имеет индекс: ${containerIndex}`);
+    // Кнопка добавления в список
+    const trackButton = document.createElement("button");
+    trackButton.className = "faceit-track-btn";
+    trackButton.dataset.nickname = nickname;
     
-    // Если нашли соответствие и ELO есть по этому индексу
-    if (containerIndex >= 0 && allEloElements.length > containerIndex) {
-        const eloText = allEloElements[containerIndex].textContent.trim();
-        const match = eloText.match(/(\d{3,4})/);
-        if (match) {
-            const elo = parseInt(match[1]);
-            if (elo >= 500 && elo <= 5000) {
-                console.log(`[FACEIT Risk] Сопоставлен ELO по индексу: ${elo}`);
-                return elo;
-            }
-        }
-    }
-    
-    // Стратегия 3: Ищем ELO по близости к нику
-    const nicknameElement = playerContainer.querySelector(`
-        div[class*="Nickname"],
-        div[class*="nickname"]
-    `);
-    
-    if (nicknameElement) {
-        // Ищем числовые значения рядом с ником
-        const containerHTML = playerContainer.innerHTML;
-        
-        // Ищем паттерны типа "2828", "2432" и т.д.
-        const numberMatches = containerHTML.match(/\b(\d{3,4})\b/g);
-        if (numberMatches) {
-            for (const numStr of numberMatches) {
-                const num = parseInt(numStr);
-                if (num >= 500 && num <= 5000) {
-                    // Проверяем, что это не часть другого контекста
-                    const contextStart = Math.max(0, containerHTML.indexOf(numStr) - 50);
-                    const contextEnd = Math.min(containerHTML.length, containerHTML.indexOf(numStr) + 50);
-                    const context = containerHTML.substring(contextStart, contextEnd);
-                    
-                    if (!context.includes('hours') && !context.includes('matches') && 
-                        !context.includes('wins') && !context.includes('streak')) {
-                        console.log(`[FACEIT Risk] Найден ELO по паттерну: ${num}`);
-                        return num;
-                    }
-                }
-            }
-        }
-    }
-    
-    console.log(`[FACEIT Risk] ELO для ${nickname} не найден, использую 2000`);
-    return 2000;
-}
-
-
-// ========== 3. УЛУЧШЕННАЯ ФУНКЦИЯ ДЛЯ КНОПКИ ==========
-function addQuickAddButton(playerContainer, nickname) {
-    const playerId = 'player_' + nickname.toLowerCase();
-    
-    if (document.querySelector(`[data-player-id="${playerId}"]`)) {
-        return;
-    }
-    
-    if (playerContainer.querySelector('.faceit-quick-add-btn')) {
-        return;
-    }
-    
-    processedPlayers.add(playerId);
-    
-    // Ищем ELO с передачей ника для отладки
-    const playerElo = getPlayerEloInMatchRoom(playerContainer, nickname);
-    const riskPercent = calculateRiskWithElo(playerElo);
-    
-    console.log(`[FACEIT Risk] ${nickname}: ELO=${playerElo}, риск=${riskPercent}%`);
-    
-    const button = document.createElement("button");
-    button.className = "faceit-quick-add-btn";
-    button.dataset.nickname = nickname;
-    button.dataset.playerId = playerId;
-    button.dataset.elo = playerElo;
-    
-    button.style.cssText = `
+    trackButton.style.cssText = `
         background: #2196f3 !important;
         color: white !important;
         border: none !important;
         border-radius: 4px !important;
         padding: 4px 8px !important;
-        margin-left: 25px !important;
         font-size: 11px !important;
         font-weight: bold !important;
         cursor: pointer !important;
-        display: inline-block !important;
-        vertical-align: middle !important;
-        min-width: 75px !important;
+        min-width: 30px !important;
         text-align: center !important;
-        position: relative !important;
-        z-index: 100 !important;
+        transition: background 0.3s !important;
+        flex-shrink: 0 !important;
     `;
     
-    button.innerHTML = '🎯 Добавить';
-    button.title = `${nickname} | ELO: ${playerElo} | Риск: ${riskPercent}%`;
+    // Проверяем, добавлен ли уже игрок в список
+    const isTracked = trackedPlayers[nickname.toLowerCase()];
+    trackButton.innerHTML = isTracked ? '✓' : '+';
+    trackButton.title = isTracked ? `Уже в списке (клик для удаления)` : `Добавить в список отслеживания`;
+    trackButton.style.background = isTracked ? '#4caf50 !important' : '#2196f3 !important';
     
-    button.addEventListener('click', function(e) {
+    // Обработчик для кнопки проверки статуса
+    statusButton.addEventListener('click', async function(e) {
         e.stopPropagation();
         e.preventDefault();
         
-        if (button.disabled) return;
+        if (statusButton.disabled) return;
         
-        const playerData = {
-            id: 'faceit_' + nickname.toLowerCase().replace(/[^a-z0-9]/g, '_'),
-            nickname: nickname,
-            elo: playerElo,
-            risk: riskPercent,
-            profileUrl: `https://www.faceit.com/players/${encodeURIComponent(nickname)}`,
-            addedAt: Date.now()
-        };
+        statusButton.disabled = true;
+        statusButton.innerHTML = '⏳ Запрос...';
+        statusButton.style.background = '#607d8b !important';
         
-        chrome.runtime.sendMessage({
-            type: 'ADD_MARKED_PLAYER',
-            playerData: playerData,
-            risk: riskPercent
-        }, (response) => {
-            if (response?.success) {
-                button.innerHTML = '✅ В списке';
-                button.style.background = '#4caf50 !important';
-                button.disabled = true;
-                button.style.opacity = '0.8';
-                button.style.cursor = 'default';
-            }
-        });
+        try {
+            const matchData = await fetchPlayerMatchStatus(nickname);
+            const status = calculateTimeStatus(matchData);
+            
+            statusButton.innerHTML = `${status.emoji} ${status.label}`;
+            statusButton.style.background = `${status.color} !important`;
+            statusButton.title = `${nickname}: ${status.label}${status.details ? ` | ${status.details}` : ''}`;
+            
+        } catch (error) {
+            statusButton.innerHTML = '❌ Ошибка';
+            statusButton.style.background = '#d32f2f !important';
+            statusButton.title = `Ошибка: ${error.message}`;
+        } finally {
+            setTimeout(() => {
+                statusButton.disabled = false;
+            }, 10000);
+        }
     });
     
-    // Пытаемся добавить кнопку рядом с ником
+    // Обработчик для кнопки добавления в список
+    trackButton.addEventListener('click', async function(e) {
+        e.stopPropagation();
+        e.preventDefault();
+        
+        const nicknameKey = nickname.toLowerCase();
+        const isCurrentlyTracked = trackedPlayers[nicknameKey];
+        
+        if (isCurrentlyTracked) {
+            // Удаляем из списка
+            delete trackedPlayers[nicknameKey];
+            trackButton.innerHTML = '+';
+            trackButton.title = `Добавить в список отслеживания`;
+            trackButton.style.background = '#2196f3 !important';
+            showNotification(`${nickname} удален из списка`, 'info');
+        } else {
+            // Добавляем в список и получаем статус
+            trackButton.disabled = true;
+            trackButton.innerHTML = '⏳';
+            trackButton.style.background = '#607d8b !important';
+            
+            try {
+                const matchData = await fetchPlayerMatchStatus(nickname);
+                const status = calculateTimeStatus(matchData);
+                
+                trackedPlayers[nicknameKey] = {
+                    nickname: nickname,
+                    addedAt: Date.now(),
+                    lastCheck: Date.now(),
+                    lastStatus: status,
+                    finishedAt: status.finishedAt || null
+                };
+                
+                trackButton.innerHTML = '✓';
+                trackButton.title = `Уже в списке (клик для удаления)`;
+                trackButton.style.background = '#4caf50 !important';
+                showNotification(`${nickname} добавлен в список отслеживания`, 'success');
+                
+            } catch (error) {
+                trackButton.innerHTML = '❌';
+                trackButton.title = `Ошибка: ${error.message}`;
+                trackButton.style.background = '#d32f2f !important';
+                showNotification(`Ошибка при добавлении ${nickname}`, 'error');
+                setTimeout(() => {
+                    trackButton.innerHTML = '+';
+                    trackButton.title = `Добавить в список отслеживания`;
+                    trackButton.style.background = '#2196f3 !important';
+                }, 2000);
+            } finally {
+                trackButton.disabled = false;
+            }
+        }
+        
+        saveTrackedPlayers();
+        updateTrackedPlayersPanel();
+    });
+    
+    // Добавляем кнопки в контейнер
+    buttonContainer.appendChild(statusButton);
+    buttonContainer.appendChild(trackButton);
+    
+    // Добавляем контейнер к игроку
     const nicknameElement = playerContainer.querySelector(`
         div[class*="Nickname"],
-        div[class*="nickname"]
+        div[class*="nickname"],
+        div.Text-sc-1ldgose
     `);
     
     if (nicknameElement?.parentElement) {
-        nicknameElement.parentElement.appendChild(button);
+        nicknameElement.parentElement.appendChild(buttonContainer);
     } else {
-        playerContainer.appendChild(button);
+        playerContainer.appendChild(buttonContainer);
     }
     
-    console.log(`[FACEIT Risk] Кнопка добавлена: ${nickname}`);
+    console.log(`[FACEIT Status] Кнопки добавлены: ${nickname}`);
 }
 
-// ========== 4. ИСПРАВЛЕННЫЙ ПОИСК ИГРОКОВ ==========
-function addButtonsToPlayers() {
-    if (isProcessing) return;
-    isProcessing = true;
+// ========== 5. ПАНЕЛЬ ОТСЛЕЖИВАЕМЫХ ИГРОКОВ ==========
+function createTrackedPlayersPanel() {
+    // Удаляем старую панель если есть
+    const oldPanel = document.getElementById('faceit-tracked-panel');
+    if (oldPanel) oldPanel.remove();
     
-    console.log('[FACEIT Risk] Поиск игроков...');
+    const panel = document.createElement("div");
+    panel.id = 'faceit-tracked-panel';
+    panel.style.cssText = `
+        position: fixed !important;
+        top: 100px !important;
+        right: 20px !important;
+        width: 300px !important;
+        background: #1f1f1f !important;
+        border: 1px solid #444 !important;
+        border-radius: 8px !important;
+        z-index: 9999 !important;
+        font-family: Arial, sans-serif !important;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+        color: white !important;
+        max-height: 500px !important;
+        overflow: hidden !important;
+        display: flex !important;
+        flex-direction: column !important;
+    `;
     
-    processedPlayers.clear();
+    panel.innerHTML = `
+        <div style="
+            background: #2196f3 !important;
+            padding: 12px 15px !important;
+            font-weight: bold !important;
+            display: flex !important;
+            justify-content: space-between !important;
+            align-items: center !important;
+            border-bottom: 1px solid #444 !important;
+        ">
+            <span>📋 Отслеживаемые игроки</span>
+            <span id="tracked-count" style="
+                background: rgba(255,255,255,0.2) !important;
+                padding: 2px 8px !important;
+                border-radius: 10px !important;
+                font-size: 12px !important;
+            ">0</span>
+        </div>
+        <div style="
+            flex-grow: 1 !important;
+            overflow-y: auto !important;
+            padding: 10px !important;
+            max-height: 400px !important;
+        " id="tracked-players-list">
+            <div style="
+                text-align: center !important;
+                padding: 20px !important;
+                color: #888 !important;
+                font-size: 14px !important;
+            ">
+                Список пуст. Нажмите "+" рядом с игроком чтобы добавить.
+            </div>
+        </div>
+        <div style="
+            padding: 10px !important;
+            border-top: 1px solid #444 !important;
+            display: flex !important;
+            justify-content: space-between !important;
+            background: #2a2a2a !important;
+        ">
+            <button id="refresh-tracked-btn" style="
+                background: #4caf50 !important;
+                color: white !important;
+                border: none !important;
+                border-radius: 4px !important;
+                padding: 6px 12px !important;
+                font-size: 12px !important;
+                cursor: pointer !important;
+                flex: 1 !important;
+                margin-right: 5px !important;
+            ">🔄 Обновить всех</button>
+            <button id="clear-tracked-btn" style="
+                background: #f44336 !important;
+                color: white !important;
+                border: none !important;
+                border-radius: 4px !important;
+                padding: 6px 12px !important;
+                font-size: 12px !important;
+                cursor: pointer !important;
+                flex: 1 !important;
+                margin-left: 5px !important;
+            ">🗑️ Очистить</button>
+        </div>
+    `;
     
-    // 1. Находим все контейнеры с игроками
-    const playerContainers = document.querySelectorAll(`
-        div.ListContentPlayer__Background-sc-36ad4183-0.bTaihS,
-        div[class*="ListContentPlayer__Background"]
-    `);
+    document.body.appendChild(panel);
     
-    console.log(`[FACEIT Risk] Найдено основных контейнеров: ${playerContainers.length}`);
+    // Обработчики для кнопок панели
+    document.getElementById('refresh-tracked-btn').addEventListener('click', async () => {
+        await refreshAllTrackedPlayers();
+    });
     
-    let addedCount = 0;
-    
-    // 2. Ищем игроков ВНУТРИ этих контейнеров
-    playerContainers.forEach(container => {
-        // Ищем никнейм разными способами
-        let nicknameElement = null;
-        let nickname = null;
-        
-        // Способ 1: Ищем в div с классом Nickname (скорее всего тут)
-        const nicknameDiv = container.querySelector(`
-            div[class*="Nickname"],
-            div[class*="nickname"],
-            div.styles__NicknameContainer-sc-c3c4cf34-4.ZwufR
-        `);
-        
-        if (nicknameDiv) {
-            // Берем первый текстовый элемент внутри
-            const textElements = nicknameDiv.querySelectorAll('div, span');
-            for (let elem of textElements) {
-                nickname = extractNickname(elem);
-                if (nickname) {
-                    nicknameElement = elem;
-                    break;
-                }
-            }
-            
-            // Если не нашли в дочерних элементах, проверяем сам div
-            if (!nickname && nicknameDiv.textContent) {
-                nickname = extractNickname(nicknameDiv);
-                if (nickname) nicknameElement = nicknameDiv;
-            }
-        }
-        
-        // Способ 2: Ищем по структуре из дебага (твои селекторы)
-        if (!nickname) {
-            const possibleElements = container.querySelectorAll(`
-                div.Nickname__Container-sc-d3288876-0.jzPjky,
-                div > div > div,
-                div[class*="Container"]:not([class*="Background"])
-            `);
-            
-            for (let elem of possibleElements) {
-                nickname = extractNickname(elem);
-                if (nickname) {
-                    nicknameElement = elem;
-                    break;
-                }
-            }
-        }
-        
-        // Способ 3: Просто ищем любой текст в контейнере
-        if (!nickname) {
-            // Ищем все элементы с текстом
-            const allElements = container.querySelectorAll('div, span');
-            for (let elem of allElements) {
-                if (elem.textContent && elem.textContent.trim()) {
-                    const text = elem.textContent.trim();
-                    // Проверяем, похоже ли на никнейм
-                    if (text.length >= 2 && text.length <= 20 && 
-                        !text.includes('ELO') && !text.match(/^\d+$/) &&
-                        !text.includes('Level') && !text.includes('FACEIT')) {
-                        nickname = text;
-                        nicknameElement = elem;
-                        break;
-                    }
-                }
-            }
-        }
-        
-        // Если нашли никнейм - добавляем кнопку
-        if (nickname && nicknameElement) {
-            console.log(`[FACEIT Risk] Найден игрок: ${nickname}`);
-            
-            // Находим ELO для этого игрока
-            let playerElo = 2000;
-            const eloIndex = addedCount; // Предполагаем, что ELO идут по порядку
-            
-            // Берем ELO из списка, который нашел дебаг
-            const allEloElements = document.querySelectorAll('div.TextBlock__Holder-sc-1bbd9bc2-0.fjYAKC > div > span');
-            if (allEloElements.length > eloIndex) {
-                const eloText = allEloElements[eloIndex].textContent.trim();
-                const match = eloText.match(/(\d+)/);
-                if (match) {
-                    playerElo = parseInt(match[1]);
-                    console.log(`[FACEIT Risk] ELO для ${nickname}: ${playerElo}`);
-                }
-            }
-            
-            addQuickAddButton(container, nickname, playerElo);
-            addedCount++;
+    document.getElementById('clear-tracked-btn').addEventListener('click', () => {
+        if (confirm('Удалить всех отслеживаемых игроков?')) {
+            trackedPlayers = {};
+            saveTrackedPlayers();
+            updateTrackedPlayersPanel();
+            showNotification('Список очищен', 'info');
         }
     });
     
-    console.log(`[FACEIT Risk] Итог: добавлено кнопок: ${addedCount}`);
-    isProcessing = false;
+    // Добавляем возможность перетаскивания
+    makePanelDraggable(panel);
 }
-// ========== 5. ФУНКЦИЯ DEBOUNCE ДЛЯ НАБЛЮДАТЕЛЯ ==========
+
+function makePanelDraggable(panel) {
+    const header = panel.querySelector('div:first-child');
+    let isDragging = false;
+    let startX, startY, startLeft, startTop;
+    
+    header.style.cursor = 'move';
+    
+    header.addEventListener('mousedown', startDrag);
+    
+    function startDrag(e) {
+        isDragging = true;
+        startX = e.clientX;
+        startY = e.clientY;
+        startLeft = parseInt(panel.style.right) || 20;
+        startTop = parseInt(panel.style.top) || 100;
+        
+        document.addEventListener('mousemove', drag);
+        document.addEventListener('mouseup', stopDrag);
+        e.preventDefault();
+    }
+    
+    function drag(e) {
+        if (!isDragging) return;
+        
+        const dx = startX - e.clientX;
+        const dy = e.clientY - startY;
+        
+        panel.style.right = (startLeft + dx) + 'px';
+        panel.style.top = (startTop + dy) + 'px';
+    }
+    
+    function stopDrag() {
+        isDragging = false;
+        document.removeEventListener('mousemove', drag);
+        document.removeEventListener('mouseup', stopDrag);
+    }
+}
+
+async function refreshAllTrackedPlayers() {
+    const refreshBtn = document.getElementById('refresh-tracked-btn');
+    const originalText = refreshBtn.textContent;
+    
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = '⏳ Обновление...';
+    refreshBtn.style.background = '#607d8b !important';
+    
+    for (const [key, player] of Object.entries(trackedPlayers)) {
+        try {
+            const matchData = await fetchPlayerMatchStatus(player.nickname);
+            const status = calculateTimeStatus(matchData);
+            
+            trackedPlayers[key] = {
+                ...player,
+                lastCheck: Date.now(),
+                lastStatus: status,
+                finishedAt: status.finishedAt || null
+            };
+            
+            console.log(`[FACEIT Status] Обновлен: ${player.nickname}`);
+        } catch (error) {
+            console.error(`[FACEIT Status] Ошибка обновления ${player.nickname}:`, error);
+        }
+    }
+    
+    saveTrackedPlayers();
+    updateTrackedPlayersPanel();
+    
+    refreshBtn.disabled = false;
+    refreshBtn.textContent = originalText;
+    refreshBtn.style.background = '#4caf50 !important';
+    
+    showNotification('Все игроки обновлены', 'success');
+}
+
+function updateTrackedPlayersPanel() {
+    const listContainer = document.getElementById('tracked-players-list');
+    const countElement = document.getElementById('tracked-count');
+    
+    if (!listContainer) return;
+    
+    const players = Object.values(trackedPlayers);
+    
+    // Обновляем счетчик
+    if (countElement) {
+        countElement.textContent = players.length;
+    }
+    
+    if (players.length === 0) {
+        listContainer.innerHTML = `
+            <div style="
+                text-align: center !important;
+                padding: 20px !important;
+                color: #888 !important;
+                font-size: 14px !important;
+            ">
+                Список пуст. Нажмите "+" рядом с игроком чтобы добавить.
+            </div>
+        `;
+        return;
+    }
+    
+    // Сортируем по времени добавления (сначала новые)
+    players.sort((a, b) => b.addedAt - a.addedAt);
+    
+    listContainer.innerHTML = '';
+    
+    players.forEach((player, index) => {
+        const playerElement = document.createElement("div");
+        playerElement.className = "tracked-player-item";
+        playerElement.style.cssText = `
+            background: ${index % 2 === 0 ? '#2a2a2a' : '#333'} !important;
+            padding: 10px !important;
+            margin-bottom: 5px !important;
+            border-radius: 4px !important;
+            font-size: 13px !important;
+            border-left: 3px solid ${player.lastStatus?.color || '#2196f3'} !important;
+        `;
+        
+        const timeAgo = Math.floor((Date.now() - player.lastCheck) / 60000);
+        const timeText = timeAgo < 1 ? 'только что' : `${timeAgo} мин назад`;
+        
+        playerElement.innerHTML = `
+            <div style="
+                display: flex !important;
+                justify-content: space-between !important;
+                align-items: center !important;
+                margin-bottom: 5px !important;
+            ">
+                <strong style="color: white !important;">${player.nickname}</strong>
+                <button class="remove-tracked-btn" data-nickname="${player.nickname}" style="
+                    background: #f44336 !important;
+                    color: white !important;
+                    border: none !important;
+                    border-radius: 50% !important;
+                    width: 20px !important;
+                    height: 20px !important;
+                    font-size: 12px !important;
+                    cursor: pointer !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                ">×</button>
+            </div>
+            <div style="color: #ccc !important; font-size: 12px !important; margin-bottom: 3px !important;">
+                ${player.lastStatus?.emoji || '❓'} ${player.lastStatus?.label || 'Неизвестно'}
+            </div>
+            <div style="color: #888 !important; font-size: 11px !important;">
+                ${player.lastStatus?.details || 'Нет данных'} • Обновлено: ${timeText}
+            </div>
+        `;
+        
+        playerElement.querySelector('.remove-tracked-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            const nickname = e.target.dataset.nickname;
+            delete trackedPlayers[nickname.toLowerCase()];
+            saveTrackedPlayers();
+            updateTrackedPlayersPanel();
+            updateTrackButtonsOnPage();
+            showNotification(`${nickname} удален из списка`, 'info');
+        });
+        
+        listContainer.appendChild(playerElement);
+    });
+}
+
+function updateTrackButtonsOnPage() {
+    document.querySelectorAll('.faceit-track-btn').forEach(button => {
+        const nickname = button.dataset.nickname;
+        const isTracked = trackedPlayers[nickname.toLowerCase()];
+        
+        button.innerHTML = isTracked ? '✓' : '+';
+        button.title = isTracked ? `Уже в списке (клик для удаления)` : `Добавить в список отслеживания`;
+        button.style.background = isTracked ? '#4caf50 !important' : '#2196f3 !important';
+    });
+}
+
+// ========== 6. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+function showNotification(message, type = 'info') {
+    const notification = document.createElement("div");
+    const colors = {
+        success: '#4caf50',
+        error: '#f44336',
+        info: '#2196f3',
+        warning: '#ff9800'
+    };
+    
+    notification.style.cssText = `
+        position: fixed !important;
+        top: 20px !important;
+        right: 20px !important;
+        z-index: 10000 !important;
+        background: ${colors[type] || colors.info} !important;
+        color: white !important;
+        padding: 12px 16px !important;
+        border-radius: 6px !important;
+        font-family: Arial !important;
+        font-size: 14px !important;
+        max-width: 300px !important;
+        box-shadow: 0 3px 10px rgba(0,0,0,0.2) !important;
+        animation: slideIn 0.3s ease !important;
+    `;
+    
+    notification.innerHTML = message;
+    document.body.appendChild(notification);
+    
+    setTimeout(() => {
+        notification.style.opacity = '0';
+        notification.style.transition = 'opacity 0.5s !important';
+        setTimeout(() => notification.remove(), 500);
+    }, 3000);
+}
+
 function debounce(func, wait) {
     let timeout;
     return function executedFunction(...args) {
@@ -332,276 +709,92 @@ function debounce(func, wait) {
     };
 }
 
-// ========== 6. ОПТИМИЗИРОВАННАЯ ИНИЦИАЛИЗАЦИЯ ==========
+// ========== 7. ПОИСК ИГРОКОВ И ИНИЦИАЛИЗАЦИЯ ==========
+function addButtonsToPlayers() {
+    if (isProcessing) return;
+    isProcessing = true;
+    
+    const playerContainers = document.querySelectorAll(`
+        div.ListContentPlayer__Background-sc-36ad4183-0.bTaihS,
+        div[class*="ListContentPlayer__Background"],
+        div.roster-player,
+        div[class*="player-container"],
+        div[class*="player-row"],
+        div[class*="player-card"]
+    `);
+    
+    playerContainers.forEach(container => {
+        const nicknameElement = container.querySelector(`
+            div[class*="Nickname"],
+            div[class*="nickname"],
+            a[href*="/players/"],
+            span[class*="nickname"]
+        `);
+        
+        if (nicknameElement) {
+            const nickname = nicknameElement.textContent.trim();
+            if (nickname && nickname.length >= 2) {
+                addMatchStatusButton(container, nickname);
+            }
+        }
+    });
+    
+    isProcessing = false;
+}
+
 function initializeMatchRoom() {
     if (!window.location.pathname.includes('/room/') && 
-        !window.location.pathname.includes('/matchroom/') &&
-        !window.location.pathname.includes('/lobby/')) {
+        !window.location.pathname.includes('/matchroom/')) {
         return;
     }
     
-    console.log('[FACEIT Risk] Комната матча обнаружена');
+    console.log('[FACEIT Status] Инициализация комнаты матча');
     
-    // Сбрасываем состояние при новой загрузке
-    processedPlayers.clear();
+    // Загружаем отслеживаемых игроков
+    loadTrackedPlayers();
     
-    // Задержка перед первым поиском
-    setTimeout(() => {
-        addButtonsToPlayers();
-    }, 2500);
+    // Создаем панель отслеживания
+    createTrackedPlayersPanel();
+    updateTrackedPlayersPanel();
     
-    // Дебаунс для наблюдателя (не чаще чем раз в 2 секунды)
-    const debouncedAddButtons = debounce(addButtonsToPlayers, 2000);
+    // Первый запуск с задержкой
+    setTimeout(addButtonsToPlayers, 1500);
     
-    const observer = new MutationObserver(() => {
-        debouncedAddButtons();
-    });
+    // Наблюдатель за изменениями
+    const debouncedAddButtons = debounce(addButtonsToPlayers, 1000);
+    const observer = new MutationObserver(debouncedAddButtons);
     
     observer.observe(document.body, {
         childList: true,
-        subtree: true,
-        attributes: false,
-        characterData: false
+        subtree: true
     });
-    
-    window.faceitMutationObserver = observer;
 }
 
-// ========== 7. ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) ==========
-function showWarning(nickname, risk) {
-    if (warningPanel) warningPanel.remove();
-    
-    warningPanel = document.createElement("div");
-    warningPanel.id = "faceit-high-risk-warning";
-    warningPanel.style.cssText = `
-        position: fixed; top: 20px; right: 20px;
-        z-index: 10000; background: #b00020; color: white; 
-        padding: 16px; border-radius: 8px; font-family: Arial; 
-        font-size: 14px; max-width: 280px; border: 2px solid #ff5252;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-    `;
-    
-    warningPanel.innerHTML = `
-        <div style="font-weight: bold; font-size: 16px; margin-bottom: 8px;">
-            ⚠️ ВНИМАНИЕ!
-        </div>
-        <div style="margin-bottom: 8px;">Высокий риск: <strong>${nickname}</strong></div>
-        <div style="margin-bottom: 12px;">Риск: <strong style="color: #ffcc00;">${risk}%</strong></div>
-        <div style="font-weight: bold; background: rgba(255, 255, 255, 0.2); padding: 8px; border-radius: 4px; text-align: center;">
-            ⛔ НЕ ЗАПУСКАЙТЕ МАТЧ!
-        </div>
-    `;
-    
-    document.body.appendChild(warningPanel);
-    warningPanel.addEventListener('click', () => warningPanel.remove());
-    setTimeout(() => warningPanel?.remove(), 15000);
-}
-
-function showRiskIndicator(riskPercent, nickname = '', eloInfo = '') {
-    if (riskIndicator) riskIndicator.remove();
-    
-    let bgColor, textColor, emoji;
-    if (riskPercent >= 80) { bgColor='#d32f2f'; textColor='#fff'; emoji='🔥'; }
-    else if (riskPercent >= 65) { bgColor='#ff5722'; textColor='#fff'; emoji='⚠️'; }
-    else if (riskPercent >= 40) { bgColor='#ffc107'; textColor='#000'; emoji='⚡'; }
-    else if (riskPercent >= 20) { bgColor='#2196f3'; textColor='#fff'; emoji='📊'; }
-    else { bgColor='#4caf50'; textColor='#fff'; emoji='✅'; }
-    
-    riskIndicator = document.createElement("div");
-    riskIndicator.id = "faceit-risk-indicator";
-    riskIndicator.style.cssText = `
-        position: fixed; top: 60px; right: 20px;
-        z-index: 9999; background: ${bgColor}; color: ${textColor};
-        padding: 12px 16px; border-radius: 8px; font-family: Arial;
-        font-size: 14px; font-weight: bold; box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-        border: 2px solid ${textColor === '#fff' ? 'rgba(255,255,255,0.3)' : 'rgba(0,0,0,0.1)'};
-        text-align: center; min-width: 120px; cursor: pointer;
-    `;
-    
-    riskIndicator.innerHTML = `
-        <div style="margin-bottom: 4px;">${emoji} РИСК</div>
-        <div style="font-size: 24px; margin: 4px 0;">${riskPercent}%</div>
-        ${nickname ? `<div style="font-size: 12px; opacity: 0.9;">${nickname}</div>` : ''}
-        ${eloInfo ? `<div style="font-size: 10px; margin-top: 4px;">${eloInfo}</div>` : ''}
-    `;
-    
-    document.body.appendChild(riskIndicator);
-    riskIndicator.addEventListener('click', () => riskIndicator.remove());
-}
-
-function getPlayerEloSimpleFixed() {
-    const text = document.body.textContent;
-    const numbers = text.match(/\b(\d{3,4})\b/g) || [];
-    
-    for (const numStr of numbers) {
-        const num = parseInt(numStr);
-        if (num >= 500 && num <= 5000) {
-            console.log('[FACEIT Risk] Найден ELO:', num);
-            return num;
-        }
-    }
-    
-    return 2000;
-}
-
-function collectPlayerData() {
-    try {
-        let nickname = '';
-        const pathMatch = window.location.pathname.match(/\/players\/([^\/]+)/);
-        if (pathMatch) nickname = decodeURIComponent(pathMatch[1]);
-        
-        if (!nickname) return null;
-        
-        return {
-            id: 'faceit_' + nickname.toLowerCase().replace(/[^a-z0-9]/g, '_'),
-            nickname,
-            elo: getPlayerEloSimpleFixed(),
-            profileUrl: window.location.href
-        };
-        
-    } catch (error) {
-        console.error('[FACEIT Risk] Ошибка сбора данных:', error);
-        return null;
-    }
-}
-
-function calculateRiskWithElo(playerElo) {
-    const eloDifference = Math.abs(playerElo - MY_ELO);
-    
-    if (eloDifference > ELO_DIFFERENCE_THRESHOLD) {
-        return LOW_RISK_ELO_DIFFERENCE;
-    }
-    
-    let risk = 0.0;
-    
-    if (eloDifference <= 100) risk += 0.3;
-    else if (eloDifference <= 250) risk += 0.2;
-    else if (eloDifference <= 500) risk += 0.1;
-    
-    risk += 0.1;
-    risk = Math.max(0, Math.min(1, risk));
-    
-    return Math.round(risk * 100);
-}
-
-function extractNickname(element) {
-    if (!element) return null;
-    
-    let nickname = element.textContent.trim();
-    nickname = nickname.replace(/[@#]/g, '');
-    
-    if (nickname.length >= 2 && nickname.length <= 25 && 
-        !nickname.includes('FACEIT') && !nickname.includes('Вы') && 
-        !nickname.includes('You') && !nickname.includes('ELO') &&
-        !nickname.includes('Level') && !nickname.match(/^\d+$/)) {
-        return nickname;
-    }
-    
-    return null;
-}
-
-// ========== ДЕБАГ ФУНКЦИЯ ==========
-function debugPageStructure() {
-    console.log('[FACEIT Risk] === ДЕБАГ СТРУКТУРЫ СТРАНИЦЫ ===');
-    
-    // 1. Ищем контейнеры по твоим селекторам
-    const testSelectors = [
-        'div.ListContentPlayer__Background-sc-36ad4183-0.bTaihS',
-        'div.RosterParty__Container-sc-a1d1e41c-0.bzxoJC',
-        'div[class*="ListContentPlayer"]',
-        'div[class*="RosterParty"]',
-        'div[class*="player-container"]'
-    ];
-    
-    testSelectors.forEach(selector => {
-        const elements = document.querySelectorAll(selector);
-        console.log(`Селектор "${selector}": ${elements.length} элементов`);
-    });
-    
-    // 2. Ищем все ссылки на игроков
-    const playerLinks = document.querySelectorAll('a[href*="/players/"]');
-    console.log(`Ссылок на игроков: ${playerLinks.length}`);
-    playerLinks.forEach((link, i) => {
-        console.log(`  ${i+1}. "${link.textContent.trim()}" -> ${link.href}`);
-    });
-    
-    // 3. Ищем текст с ELO
-    const eloElements = document.querySelectorAll('div.TextBlock__Holder-sc-1bbd9bc2-0.fjYAKC > div > span');
-    console.log(`Элементов ELO: ${eloElements.length}`);
-    eloElements.forEach((el, i) => {
-        console.log(`  ${i+1}. ELO текст: "${el.textContent}"`);
-    });
-    
-    console.log('[FACEIT Risk] === КОНЕЦ ДЕБАГА ===');
-}
-
-// И вызови её в initializeMatchRoom после задержки:
-function initializeMatchRoom() {
-    if (!window.location.pathname.includes('/room/') && 
-        !window.location.pathname.includes('/matchroom/') &&
-        !window.location.pathname.includes('/lobby/')) {
-        return;
-    }
-    
-    console.log('[FACEIT Risk] Комната матча обнаружена');
-    
-    // Сбрасываем состояние при новой загрузке
-    processedPlayers.clear();
-    
-    // Задержка перед первым поиском
-    setTimeout(() => {
-        debugPageStructure(); // <-- ДОБАВЬ ЭТУ СТРОКУ
-        addButtonsToPlayers();
-    }, 2500);
-    
-    // ... остальной код без изменений
-}
-
+// ========== 8. ОСНОВНОЙ ЗАПУСК ==========
 function main() {
-    console.log('[FACEIT Risk] Инициализация для:', window.location.pathname);
+    console.log('[FACEIT Status] Запуск системы');
     
-    if (window.faceitMutationObserver) {
-        window.faceitMutationObserver.disconnect();
-        window.faceitMutationObserver = null;
-    }
-    
-    // Для страниц профилей
-    if (window.location.pathname.includes('/players/')) {
-        setTimeout(() => {
-            const playerData = collectPlayerData();
-            
-            if (playerData) {
-                const riskPercent = calculateRiskWithElo(playerData.elo);
-                const eloInfo = `ELO: ${playerData.elo}`;
-                
-                showRiskIndicator(riskPercent, playerData.nickname, eloInfo);
-                
-                if (riskPercent >= 65) {
-                    showWarning(playerData.nickname, riskPercent);
-                }
-            }
-        }, 2000);
-    }
-    
-    // Для комнат матча
     if (window.location.pathname.includes('/room/') || 
-        window.location.pathname.includes('/matchroom/') ||
-        window.location.pathname.includes('/lobby/')) {
+        window.location.pathname.includes('/matchroom/')) {
         initializeMatchRoom();
     }
 }
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === "FORCE_UPDATE") {
-        addButtonsToPlayers();
-    }
-    sendResponse({ received: true });
-});
-
+// Запуск при загрузке страницы
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', main);
 } else {
     main();
 }
 
-console.log('[FACEIT Risk] Система готова!');
+// Добавляем CSS анимацию
+const style = document.createElement('style');
+style.textContent = `
+    @keyframes slideIn {
+        from { transform: translateX(100%); opacity: 0; }
+        to { transform: translateX(0); opacity: 1; }
+    }
+`;
+document.head.appendChild(style);
+
+console.log('[FACEIT Status] Система готова к работе!');    
